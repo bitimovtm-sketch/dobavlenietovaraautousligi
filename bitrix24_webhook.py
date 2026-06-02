@@ -52,6 +52,31 @@ def bitrix_call(method: str, params: dict) -> dict:
     return data.get("result", data)
 
 
+def parse_form_array(form: dict, key: str):
+    """
+    Битрикс24 шлёт данные в PHP-формате массива:
+        auth[domain]=...&auth[member_id]=...
+        document_id[0]=crm&document_id[1]=...&document_id[2]=DYNAMIC_1048_28
+
+    Эта функция собирает все ключи вида key[sub_key] в словарь или список.
+    """
+    prefix = f"{key}["
+    items = {}
+    for form_key, value in form.items():
+        if form_key.startswith(prefix) and form_key.endswith("]"):
+            sub_key = form_key[len(prefix):-1]
+            items[sub_key] = value
+
+    if not items:
+        return None
+
+    # Если все ключи — числа, возвращаем список
+    if all(k.isdigit() for k in items.keys()):
+        return [items[k] for k in sorted(items.keys(), key=int)]
+    # Иначе словарь
+    return items
+
+
 def parse_money(value, default_currency="RUB"):
     """
     Парсит поле типа "деньги" Битрикс24: "123.45|RUB" → (123.45, "RUB").
@@ -82,33 +107,37 @@ def parse_quantity(value, default=1.0) -> float:
         return default
 
 
-def parse_item_id(document_id_raw: str) -> int:
+def parse_item_id(document_id) -> int:
     """
-    Разбирает document_id вида:
-    ["crm","Bitrix\\Crm\\Integration\\BizProc\\Document\\Dynamic","DYNAMIC_1048_18"]
-    и возвращает числовой ID элемента (18).
+    Разбирает document_id и возвращает ID элемента.
+    Принимает либо список (из PHP-массива), либо JSON-строку.
+
+    Пример: ["crm","Bitrix\\Crm\\...","DYNAMIC_1048_18"] → 18
     """
-    try:
-        parsed = json.loads(document_id_raw)
-    except Exception:
-        parsed = document_id_raw
+    if isinstance(document_id, str):
+        try:
+            document_id = json.loads(document_id)
+        except Exception:
+            pass
 
-    if isinstance(parsed, list) and len(parsed) >= 3:
-        return int(parsed[2].split("_")[-1])
+    if isinstance(document_id, list) and len(document_id) >= 3:
+        return int(document_id[2].split("_")[-1])
 
-    raise ValueError(f"Не удалось разобрать document_id: {document_id_raw}")
+    raise ValueError(f"Не удалось разобрать document_id: {document_id}")
 
 
-def check_domain(auth_raw: str) -> bool:
+def check_domain(auth) -> bool:
     """Проверяет, что запрос пришёл от нашего Битрикс24."""
     if not ALLOWED_DOMAIN:
-        return True  # Проверка отключена
-    try:
-        auth = json.loads(auth_raw) if isinstance(auth_raw, str) else auth_raw
-        domain = auth.get("domain", "") if isinstance(auth, dict) else ""
-        return domain == ALLOWED_DOMAIN
-    except Exception:
+        return True
+    if isinstance(auth, str):
+        try:
+            auth = json.loads(auth)
+        except Exception:
+            return False
+    if not isinstance(auth, dict):
         return False
+    return auth.get("domain", "") == ALLOWED_DOMAIN
 
 
 # ──────────────────────────────────────────────
@@ -123,19 +152,26 @@ def from_smart_process():
     """
     # Получаем данные из тела запроса (form-encoded от Битрикс24)
     form = request.form.to_dict()
-    auth_raw         = form.get("auth", "{}")
-    document_id_raw  = form.get("document_id", "")
+
+    # Битрикс шлёт PHP-массивы: auth[domain]=..., document_id[0]=...
+    # Сначала пробуем разобрать PHP-формат, если не получилось — пробуем JSON
+    auth        = parse_form_array(form, "auth") or form.get("auth", "{}")
+    document_id = parse_form_array(form, "document_id") or form.get("document_id", "")
 
     # Защита: проверяем что запрос пришёл от нашего Битрикс24
-    if not check_domain(auth_raw):
-        return jsonify({"ok": False, "error": "Запрос пришёл не от разрешённого Битрикс24"}), 403
+    if not check_domain(auth):
+        return jsonify({
+            "ok": False,
+            "error": "Запрос пришёл не от разрешённого Битрикс24",
+            "received_auth": auth if isinstance(auth, dict) else "не удалось разобрать",
+        }), 403
 
-    if not document_id_raw:
+    if not document_id:
         return jsonify({"ok": False, "error": "document_id не передан"}), 400
 
     # 1. Получаем ID элемента смарт-процесса
     try:
-        item_id = parse_item_id(document_id_raw)
+        item_id = parse_item_id(document_id)
     except Exception as e:
         return jsonify({"ok": False, "error": f"Ошибка разбора document_id: {e}"}), 400
 
